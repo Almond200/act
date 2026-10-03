@@ -1,0 +1,17 @@
+<!doctype html><html><head><meta charset="utf-8">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+window.requestAnimationFrame=cb=>setTimeout(()=>cb(performance.now()),0);</script>
+<script src="../js/parser.js"></script>
+</head><body><pre id="o">ready</pre>
+<script>
+window.R={};
+async function usePdf(name){ const buf=await (await fetch('/_dev/'+name)).arrayBuffer(); window.PDF=await pdfjsLib.getDocument({data:buf}).promise; }
+async function dbg(p,skip){const D=TS.parser._dev; const pg=await D.extractPage(PDF,p); const {lines,g}=D.prepPage(pg); const cl=D.buildClusters(pg,lines,g,{skipUnderlines:skip}); const st=D.pageStream(pg,lines,cl); return st.map(e=>e.type==='fig'?`${e.c} FIG ${e.rect.map(Math.round)}`:`${e.c} ${e.line.y.toFixed(1)} x${e.line.x0.toFixed(0)} h${e.line.h}: ${e.line.text}`).join('\n');}
+async function run(name){ const buf=await (await fetch('/_dev/'+name)).arrayBuffer(); const t0=performance.now(); R[name]=await TS.parser.parsePdf(buf); R[name].ms=performance.now()-t0; return R[name]; }
+function summary(r){ return [r.title, r.pageCount+'pp', Math.round(r.ms)+'ms', ...r.warnings.map(w=>'WARN '+w), ...r.sections.map(s=>`${s.kind} p${s.pages} ${s.minutes}min q=${s.questions.length}/${s.expected} passages=${s.passages.length} key=${s.keyCount} ladders=${[...new Set(s.questions.map(q=>q.ladder))]}`)].join('\n'); }
+const rt=runs=>runs.map(r=>r.t==='m'?`[${r.n}]`:(r.u?`_${r.s}_`:r.s)).join('');
+function btext(blocks){ return (blocks||[]).map(b=>b.t==='fig'?`<FIG p${b.page} ${b.rect.map(Math.round)}>`:(b.lines.map(l=>(l.num?`(${l.num})`:'')+rt(l.runs)).join(' / '))).join('\n  '); }
+function q(r,kind,n){ const s=r.sections.find(s=>s.kind===kind); const qq=s.questions.find(q=>q.n===n); return `Q${n} passage=${qq.passage} ans=${qq.answer}\n  ${btext(qq.stem)}\n`+qq.choices.map(c=>`  ${c.L}: ${btext(c.blocks)}`).join('\n'); }
+function pas(r,kind,i,max=3000){ const p=r.sections.find(s=>s.kind===kind).passages[i]; return (`${p.title} | ${p.subtitle||''} | intro: ${p.intro?btext([p.intro]):''} | qn=${p.questionNums||''}\n  `+btext(p.blocks)).slice(0,max); }
+</script></body></html>

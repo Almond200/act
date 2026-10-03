@@ -1,0 +1,33 @@
+<!doctype html><html><head><meta charset="utf-8">
+<link rel="stylesheet" href="../css/app.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';</script>
+<style>
+body{background:#fff;overflow:auto}
+.row{display:grid;grid-template-columns:420px 1fr;gap:24px;border-bottom:2px solid #ddd;padding:14px 20px;font-size:16px}
+.row .orig img{width:400px;border:1px solid #eee}
+.row h4{margin:0 0 6px;font:600 13px system-ui;color:#555}
+.row .choice{padding:4px 8px}
+.row .qstem{margin-bottom:8px}
+.bad{background:#fff0f0}
+</style>
+</head><body><div id="app" class="hidden"></div><div id="out"></div>
+<script>for (const f of ["../js/store.js","../js/parser.js","../js/render.js","../js/ocr.js","../js/app.js","reimport.js"]) document.write(`<script src="${f}?t=${Date.now()}"><\/script>`);</script>
+<script>
+async function show(testId, si, from=1, to=99){
+  const t=await TS.store.getTest(testId); await TS.render.open(testId, await TS.store.getPdf(testId));
+  const sec=t.sections[si]; const out=document.getElementById('out'); out.replaceChildren();
+  for(const q of sec.questions){ if(q.n<from||q.n>to) continue;
+    const row=document.createElement('div'); row.className='row';
+    const o=document.createElement('div'); o.className='orig'; o.innerHTML=`<h4>${sec.kind} Q${q.n} · p${q.region.map(r=>r.page)} · key ${q.answer} · passage ${q.passage}</h4>`;
+    for(const r of q.region){ o.append(TS.render.img({page:r.page,rect:r.rect},1)); }
+    o.querySelectorAll('img').forEach(i=>{i.style.width='400px'});
+    const n=document.createElement('div');
+    const st=document.createElement('div'); st.className='qstem'; st.append(TS.app.renderBlocks(q.stem,{noHeadings:true})); n.append(st);
+    for(const c of q.choices){ const d=document.createElement('div'); d.className='choice'; const ct=document.createElement('div'); ct.className='ct'; ct.append(TS.app.renderBlocks(c.blocks,{noHeadings:true})); d.append(Object.assign(document.createElement('span'),{className:'L',textContent:c.L+'.'}),ct); n.append(d);}
+    if(q.choices.some(c=>!c.blocks.length) || q.choices.length<4) row.classList.add('bad');
+    row.append(o,n); out.append(row);
+  }
+  return sec.questions.length;
+}
+</script></body></html>

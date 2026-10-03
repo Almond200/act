@@ -1,0 +1,56 @@
+<!doctype html><html><head><meta charset="utf-8">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+</head><body><pre id="o">loading</pre>
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+window.docs={};
+async function load(name){ if(!docs[name]) docs[name]=await pdfjsLib.getDocument('/_dev/'+name).promise; return docs[name]; }
+async function items(name,p){
+  const d=await load(name), pg=await d.getPage(p), vp=pg.getViewport({scale:1});
+  const tc=await pg.getTextContent();
+  return {w:vp.width,h:vp.height,styles:tc.styles,items:tc.items.map(i=>({s:i.str,x:+i.transform[4].toFixed(1),y:+(vp.height-i.transform[5]).toFixed(1),w:+i.width.toFixed(1),h:+i.height.toFixed(1),f:i.fontName,eol:i.hasEOL}))};
+}
+async function ops(name,p){
+  const d=await load(name), pg=await d.getPage(p), ol=await pg.getOperatorList();
+  const O=pdfjsLib.OPS, inv={}; for(const k in O) inv[O[k]]=k;
+  const out=[]; for(let i=0;i<ol.fnArray.length;i++){ const f=inv[ol.fnArray[i]]; if(/Path|Image|rectangle|fill|stroke|transform|save|restore|Form/i.test(f)) out.push([f,JSON.stringify(ol.argsArray[i])?.slice(0,200)]); }
+  return out;
+}
+async function lines(name,p,filter){
+  const r=await items(name,p); const its=r.items.filter(i=>i.s.trim());
+  its.sort((a,b)=>a.y-b.y||a.x-b.x);
+  const rows=[]; for(const i of its){ const L=rows.find(l=>Math.abs(l.y-i.y)<2 && Math.abs(l.col-(i.x<r.w/2?0:1))<1); if(L){L.it.push(i);} else rows.push({y:i.y,col:i.x<r.w/2?0:1,it:[i]}); }
+  rows.sort((a,b)=>a.col-b.col||a.y-b.y);
+  return rows.map(l=>{l.it.sort((a,b)=>a.x-b.x); return `${l.col} ${l.y} x${l.it[0].x} h${l.it[0].h} ${l.it[0].f.slice(-2)}: `+l.it.map(i=>i.s).join('·');}).join('\n');
+}
+async function graphics(name,p){
+  const d=await load(name), pg=await d.getPage(p), vp=pg.getViewport({scale:1}), ol=await pg.getOperatorList();
+  const O=pdfjsLib.OPS; let ctm=[1,0,0,1,0,0]; const st=[]; const out=[]; let cur=null;
+  const mul=(a,b)=>[a[0]*b[0]+a[2]*b[1],a[1]*b[0]+a[3]*b[1],a[0]*b[2]+a[2]*b[3],a[1]*b[2]+a[3]*b[3],a[0]*b[4]+a[2]*b[5]+a[4],a[1]*b[4]+a[3]*b[5]+a[5]];
+  const tp=(x,y)=>[ctm[0]*x+ctm[2]*y+ctm[4], vp.height-(ctm[1]*x+ctm[3]*y+ctm[5])];
+  for(let i=0;i<ol.fnArray.length;i++){ const f=ol.fnArray[i], a=ol.argsArray[i];
+    if(f===O.save) st.push(ctm); else if(f===O.restore) ctm=st.pop()||ctm;
+    else if(f===O.transform) ctm=mul(ctm,a);
+    else if(f===O.paintFormXObjectBegin){ st.push(ctm); if(a[0]) ctm=mul(ctm,a[0]); }
+    else if(f===O.paintFormXObjectEnd){ ctm=st.pop()||ctm; }
+    else if(f===O.constructPath){ const [opsA,coords]=a; let xs=[],ys=[],k=0, n=0;
+      for(const op of opsA){ if(op===19){ const [x,y,w,h]=coords.slice(k,k+4); k+=4; for(const [px,py] of [[x,y],[x+w,y+h]]){const q=tp(px,py);xs.push(q[0]);ys.push(q[1]);} }
+        else if(op===13||op===14){const q=tp(coords[k],coords[k+1]);k+=2;xs.push(q[0]);ys.push(q[1]);}
+        else if(op===15){for(let j=0;j<3;j++){const q=tp(coords[k],coords[k+1]);k+=2;xs.push(q[0]);ys.push(q[1]);}}
+        else if(op===16||op===17){for(let j=0;j<2;j++){const q=tp(coords[k],coords[k+1]);k+=2;xs.push(q[0]);ys.push(q[1]);}} n++; }
+      if(xs.length){ cur={t:'path',n,x0:Math.min(...xs),y0:Math.min(...ys),x1:Math.max(...xs),y1:Math.max(...ys)}; }
+    }
+    else if([O.stroke,O.fill,O.eoFill,O.fillStroke,O.eoFillStroke,O.closeStroke,O.closeFillStroke].includes(f)){ if(cur){cur.op=f; out.push(cur); cur=null;} }
+    else if(f===O.endPath){ cur=null; }
+    else if(f===O.paintImageXObject||f===O.paintInlineImageXObject||f===O.paintImageMaskXObject){ const q0=tp(0,0),q1=tp(1,1); out.push({t:'img',x0:Math.min(q0[0],q1[0]),y0:Math.min(q0[1],q1[1]),x1:Math.max(q0[0],q1[0]),y1:Math.max(q0[1],q1[1])}); }
+  }
+  return out.map(g=>({...g,x0:+g.x0.toFixed(1),y0:+g.y0.toFixed(1),x1:+g.x1.toFixed(1),y1:+g.y1.toFixed(1)}));
+}
+async function show(name,p,boxes){
+  const d=await load(name), pg=await d.getPage(p), vp=pg.getViewport({scale:1.5});
+  let c=document.getElementById('cv'); if(!c){c=document.createElement('canvas');c.id='cv';document.body.prepend(c);}
+  c.width=vp.width;c.height=vp.height; const ctx=c.getContext('2d'); await pg.render({canvasContext:ctx,viewport:vp}).promise;
+  ctx.strokeStyle='red';ctx.lineWidth=1.5; for(const b of boxes||[]){ctx.strokeStyle=b.c||'red';ctx.strokeRect(b.x0*1.5,b.y0*1.5,(b.x1-b.x0)*1.5+1,(b.y1-b.y0)*1.5+1);}
+}
+document.getElementById('o').textContent='ready';
+</script></body></html>
