@@ -147,6 +147,7 @@ kbd { font: 12px ui-monospace, Menlo, monospace; border: 1px solid var(--line); 
 .ptext .p.h { font-weight: 700; margin-top: calc(var(--fs) * 1.1); }
 .ptext .p.pnum { text-align: center; margin: calc(var(--fs) * .4) 0 calc(var(--fs) * .35); }
 .ptext .p.bullet { padding-left: 1.2em; text-indent: -1.2em; }
+.p.bullet { padding-left: 1.6em; text-indent: -1.6em; }
 .ptext.lines .p { margin-bottom: 0; }
 .ptext.lines .p + .p { margin-top: 0; }
 .ptext.lines .ln { position: relative; }

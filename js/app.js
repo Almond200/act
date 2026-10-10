@@ -74,8 +74,8 @@
   // ================= text rendering =================
   // "(lines 23–24)", "in lines 5–7": meaningless without booklet line numbers
   const stripRefs = (t) => t
-    .replace(/\s*\((?:see\s+)?lines?\s+\d+(?:\s*(?:[–—-]|to|through|and|,)\s*\d+)*\)/gi, '')
-    .replace(/,?\s+(?:in|at|from|of)\s+lines?\s+\d+(?:\s*(?:[–—-]|to|through|and)\s*\d+)*/gi, '');
+    .replace(/\s*\((?:see\s+)?lines?\s+\d+(?:\s*(?:[–—−-]|to|through|and|,)\s*\d+)*\)/gi, '')
+    .replace(/,?\s+(?:in|at|from|of)\s+lines?\s+\d+(?:\s*(?:[–—−-]|to|through|and)\s*\d+)*/gi, '');
   function renderRuns(runs, parent, noRefs) {
     if (noRefs) {
       runs = runs.map((r) => (r.s && !r.t ? { ...r, s: stripRefs(r.s) } : r));
@@ -382,7 +382,7 @@
       if (!card.isConnected) return;
       bar.style.width = `${Math.round(f * 100)}%`;
       if (m) msg.textContent = m;
-      if (m && /Recognizing/.test(m)) tip.style.display = '';
+      if (m && /Recogni|Starting the text|scanned pages/.test(m)) tip.style.display = '';
       document.title = f >= 1 ? 'Testside — digital ACT practice' : `${Math.round(f * 100)}% · importing — Testside`;
     } };
   }
@@ -771,6 +771,18 @@
     renderQuestion();
     updateChrome();
     save();
+    prefetchAround(R.idx);
+  }
+  // draw the neighbouring questions' images (figures, scanned choices) while the current one is read
+  function prefetchAround(i) {
+    const R = RUN;
+    if (!R || !TS.render || !TS.render.prefetch) return;
+    const grab = (qq) => {
+      if (!qq) return;
+      TS.render.prefetch(qq.stem);
+      for (const c of qq.choices || []) TS.render.prefetch(c.blocks);
+    };
+    setTimeout(() => { if (RUN === R) { grab(R.sec.questions[i + 1]); grab(R.sec.questions[i + 2]); grab(R.sec.questions[i - 1]); } }, 150);
   }
   function updateChrome() {
     const R = RUN;
@@ -893,7 +905,7 @@
   // "(lines 26–45)", "line 12", "lines 3 and 7" → [[from, to], …]
   function refsIn(txt) {
     const out = [];
-    for (const m of txt.matchAll(/\blines?\s+(\d+)(?:\s*(?:[–—-]|through|to)\s*(\d+))?(?:\s*(?:and|,)\s*(\d+)(?:\s*[–—-]\s*(\d+))?)?/gi)) {
+    for (const m of txt.matchAll(/\blines?\s+(\d+)(?:\s*(?:[–—−-]|through|to)\s*(\d+))?(?:\s*(?:and|,)\s*(\d+)(?:\s*[–—−-]\s*(\d+))?)?/gi)) {
       out.push([+m[1], +(m[2] || m[1])]);
       if (m[3]) out.push([+m[3], +(m[4] || m[3])]);
     }
@@ -910,11 +922,19 @@
     const starts = [];
     for (const tn of nodes) { starts.push(T.length); T += tn.data; }
     const lineEls = [...rootEl.querySelectorAll('[data-ln]')];
-    const norm = (x) => x.replace(/[“”"]/g, '"').replace(/[‘’]/g, "'").replace(/[—–]/g, '-').replace(/\s+/g, ' ').toLowerCase();
-    const TN = norm(T);
+    // (all quote marks alike: questions often requote a passage's “…” as ‘…’)
+    const norm = (x) => x.replace(/[“”"‘’']/g, '"').replace(/[—–]/g, '-').replace(/\s+/g, ' ').toLowerCase();
+    // normalized text with a map back to raw offsets (whitespace runs collapse to one space)
+    let TN = '';
+    const map = [];
+    for (let i = 0; i < T.length; i++) {
+      if (/\s/.test(T[i]) && /\s/.test(T[i - 1] || '')) continue;
+      if (/[“”"‘’']/.test(T[i])) continue; // quote marks don't take part in matching
+      TN += norm(T[i]); map.push(i);
+    }
+    map.push(T.length);
     return {
-      rootEl, nodes, starts, T, norm,
-      TN: TN.length === T.length ? TN : null, // offsets only line up when no whitespace runs collapsed
+      rootEl, nodes, starts, T, norm, TN, map,
       lineStart: new Map(lineEls.map((el) => [+el.dataset.ln, pointOffset(rootEl, el, 0)])),
       lineEndMap: new Map(lineEls.map((el) => [+el.dataset.ln, pointOffset(rootEl, el, el.childNodes.length)])),
       paraStarts: [...rootEl.querySelectorAll('.p')].map((p) => pointOffset(rootEl, p, 0)),
@@ -923,16 +943,17 @@
   // Find a quotation in the passage; "…" inside it means words were left out, so match the
   // first and last fragments. `near` = [from, to] limits the search when line numbers are known.
   function findQuote(P, quote, near) {
-    if (!P.TN) return null;
-    const frags = P.norm(quote).split(/\s*(?:\.\s?\.\s?\.|…)\s*/).map((f) => f.replace(/^[\s,;:]+|[\s,;:.]+$/g, '')).filter((f) => f.length >= 3);
-    if (!frags.length || frags.join(' ').length < 8) return null;
+    const frags = P.norm(quote).replace(/"/g, '').split(/\s*(?:\.\s?\.\s?\.|…)\s*/).map((f) => f.replace(/^[\s,;:]+|[\s,;:.]+$/g, '')).filter((f) => f.length >= 3);
+    if (!frags.length || frags.join(' ').length < (near ? 3 : 4)) return null;
+    const wordAt = (i, j) => !/[a-z0-9]/i.test(P.TN[i - 1] || '') && !/[a-z0-9]/i.test(P.TN[j] || '');
     const first = frags[0], last = frags[frags.length - 1];
     const hits = [];
     for (let i = P.TN.indexOf(first); i >= 0; i = P.TN.indexOf(first, i + 1)) {
-      if (near && (i < near[0] - 250 || i > near[1] + 250)) continue;
+      if (near && (P.map[i] < near[0] - 250 || P.map[i] > near[1] + 250)) continue;
       let end = i + first.length;
       if (frags.length > 1) { const j = P.TN.indexOf(last, end); if (j < 0 || j - end > 1500) continue; end = j + last.length; }
-      hits.push([i, end]);
+      if (!wordAt(i, end)) continue;
+      hits.push([P.map[i], P.map[end - 1] + 1]);
     }
     // without line numbers, only trust an unambiguous match
     return hits.length === 1 || (near && hits.length) ? hits[0] : null;
@@ -951,9 +972,14 @@
     }
     // 1) a quotation from the passage (near the reference, if there is one)
     let found = null;
-    for (const m of txt.matchAll(/[“"]([^”"]{6,})[”"]/g)) {
+    for (const m of txt.matchAll(/[“"]([^”"]{2,})[”"]/g)) {
       found = findQuote(P, m[1], refs.length ? [s0, e0] : null);
       if (found) break;
+    }
+    // "As it is used in line 51, the phrase ran to most nearly means": just that word or phrase
+    if (!found && refs.length) {
+      const w = txt.match(/\b(?:word|phrase|term|expression)\s+(.{2,60}?)\s*,?\s+(?:most nearly means|is used to|refers to|primarily)/i);
+      if (w) found = findQuote(P, w[1].replace(/^[“"‘']|[”"’']$/g, ''), [s0, e0]);
     }
     if (found) return found;
     if (!refs.length) return null;
@@ -968,7 +994,8 @@
     };
     let a0 = null;
     const lineAEnd = lineEnd(refs[0][0]);
-    for (let i = s0; i < lineAEnd; i++) if (!/\s/.test(T[i]) && sentStartAt(i)) { a0 = i; break; }
+    // (a closing quote or bracket at the line start ends the previous sentence)
+    for (let i = s0; i < lineAEnd; i++) if (!/[\s"”’)\]—–\-,;:]/.test(T[i]) && sentStartAt(i)) { a0 = i; break; }
     if (a0 == null) { a0 = s0; while (a0 > 0 && !sentStartAt(a0)) a0--; while (/\s/.test(T[a0])) a0++; }
     let b0;
     let k = e0 - 1;
@@ -979,6 +1006,17 @@
       b0 = Math.min(T.length, j + 1);
     } else b0 = k + 1;
     while (b0 < T.length && /["”’)\]]/.test(T[b0])) b0++;
+    // "(beginning with …)" / "(ending with the word breathe)" pin the ends exactly
+    const wordEnd = txt.match(/ending with (?:the (?:word|phrase) )?[“"]?([^”")]+?)[”"]?\)/i);
+    if (wordEnd) {
+      const w = wordEnd[1].trim().toLowerCase(), i = T.toLowerCase().indexOf(w, a0);
+      if (i >= 0 && i < e0 + 400) { b0 = i + w.length; while (b0 < T.length && /[.,;:!?"”’)]/.test(T[b0])) b0++; }
+    }
+    const wordStart = txt.match(/beginning with (?:the (?:word|phrase) )?[“"]?([^”")]+?)[”"]?[),]/i);
+    if (wordStart) {
+      const w = wordStart[1].trim().toLowerCase(), i = T.toLowerCase().indexOf(w, Math.max(0, s0 - 200));
+      if (i >= 0 && i < b0) a0 = i;
+    }
     return [a0, b0];
   }
   function toRange(P, [a0, b0]) {

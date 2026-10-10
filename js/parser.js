@@ -20,15 +20,27 @@
     ['science', /^SCIENCE( REASONING)? TEST$/],
   ];
   const CHROME_RE = /GO\s*ON\s*TO\s*THE\s*NEXT\s*PAGE|DO\s*YOUR\s*FIGURING\s*HERE|DO\s*NOT\s*(TURN|RETURN)|^\s*ACT-[A-Z0-9]+\s*$|©\s*\d{4}\s*(by\s*)?ACT|Page \d+ of \d+|QU\d{5}|^\s*STOP!?\s*$|^\s*END OF (TEST|THE)/i;
-  const END_RE = /END\s*OF\s*(TEST|THE\s*(ENGLISH|MATH\w*|READING|SCIENCE))|^\s*STOP!?\s*$/i;
+  const END_RE = /END\s*OF\s*(TEST|THE\s*(ENGLISH|MATH\w*|READING|SCIENCE))/i;
+  const STOP_RE = /^\s*STOP!?\s*$/; // capitals only: "Stop" can be a label inside a figure
   const NONTEST_RE = /Scoring Key|Answer Key|WRITING TEST|Practice Answer Document|How to Score|Scoring Guide|Calculating a Composite|Writing Test Scoring|Conversion of Raw Scores/i;
   const romanFix = (t) => t.replace(/^(\s*PASSAGE\s+)(\S+)/i, (m, a, r) => a + r.replace(/[l|1]/g, 'I'));
   const PASSAGE_RE = /^\s*PASSAGE\s+([IVX]{1,4}|[Il|1]{1,3}V?|V[Il|1]{0,3})(?=\s|$|[^A-Za-z])/i; // OCR reads I as l, | or 1
   const LADDERS = [['A', 'B', 'C', 'D', 'E'], ['F', 'G', 'H', 'J', 'K']];
   // "A. text", "12. F. text", and OCR variants with a stray glyph first ("» F. NO CHANGE", "te4. F.")
   const JUNK_LEAD = /^(?:[^A-Za-z\s]{1,4}\s+|[a-z]{0,2}\d{1,2}[.,]\s*)/;
+  // an italic "C. elegans" / "E. coli" is a species name, not choice C (choice letters are never italic)
+  const speciesLead = (line) => line && line.items && line.items[0] && line.items[0].italic && /^[A-K]\.\s*[a-z]/.test(line.items[0].s.trim());
+  const labelOfLine = (line) => {
+    if (speciesLead(line)) return null;
+    return labelInText(line.text);
+  };
   function labelInText(text) {
     let t = text.trim();
+    // "C, D, or E. A circle…" is a list of points in a sentence, not choice C
+    if (/^[A-K],\s*(?:[A-K][,.]?\s|or\s|and\s)/.test(t)) return null;
+    // OCR slips: "F." read as "EF." / "FF.", and "J." as "Jo"
+    const slip = t.match(/^[A-Z]([FGHJK])\.\s+[a-z]/) || t.match(/^(J)o{1,2}\s+[a-z]{3}/);
+    if (slip) return slip[1];
     for (let k = 0; k < 2; k++) {
       const m = t.match(/^([A-HJK])[.,](\s|$)/);
       if (m) return m[1];
@@ -181,8 +193,9 @@
     const keep = [];
     // Detect whole chrome phrases first on joined line text (e.g. "GO ON TO THE NEXT PAGE.")
     for (const it of pg.items) {
-      if (END_RE.test(it.s)) pg.hasEnd = true;
-      if (it.h >= 28) continue; // giant section digits
+      if (!it.s.trim()) continue; // (emptied padding glyphs)
+      if (END_RE.test(it.s) || (STOP_RE.test(it.s) && !pg.items.some((x) => /GO\s*ON\s*TO/i.test(x.s)))) pg.hasEnd = true;
+      if (it.h >= 28 && !RISKY_FONT.test(it.name || '')) continue; // giant section digits (tall math-font glyphs are brackets)
       if (it.y < topCut || it.top > botCut) continue;
       if (CHROME_RE.test(it.s)) continue;
       keep.push(it);
@@ -232,9 +245,9 @@
         const prev = l.items[k - 1], it = l.items[k];
         const h = Math.max(prev.h, it.h);
         const lineNo = k === 1 && /^\d{1,3}$/.test(prev.s.trim()) && prev.h < it.h - 0.5 && prev.x - colMin[l.c] < 24; // reading line numbers sit at the column's left edge
-        const afterLabel = k === 1 && /^[A-K]\.$/.test(prev.s.trim()) && it.x - prev.x1 > 12;
+        const afterLabel = k === 1 && /^[A-K]\.$/.test(prev.s.trim()) && it.x - prev.x1 > (it.ocr ? 40 : 12);
         const afterNum = k === 1 && /^\d{1,2}\.$/.test(prev.s.trim()) && it.x - prev.x1 < 5 * h; // "32. [F. lost by OCR] NO CHANGE"
-        if (!lineNo && !afterNum && (afterLabel || it.x - prev.x1 > Math.max(2.2 * h, 16))) { cur = { ...l, items: [it] }; split.push(cur); } else cur.items.push(it);
+        if (!lineNo && !afterNum && (afterLabel || it.x - prev.x1 > (it.ocr && prev.ocr ? Math.max(5 * h, 38) : Math.max(2.2 * h, 16)))) { cur = { ...l, items: [it] }; split.push(cur); } else cur.items.push(it);
       }
     }
     lines = split;
@@ -323,9 +336,11 @@
 
   // Build figure clusters from graphics, absorbing nearby labels / captions.
   function buildClusters(pg, lines, g, { skipUnderlines }) {
-    pg.labelBoxes = lines.filter((l) => /^[A-K]\.(\s|$)/.test(l.text)).map((l) => ({ x0: l.x0, x1: l.x0 + 12, y0: l.top, y1: l.bottom }));
+    pg.labelBoxes = lines.filter((l) => /^[A-K]\.(\s|$)/.test(l.text) && !speciesLead(l)).map((l) => ({ x0: l.x0, x1: l.x0 + 12, y0: l.top, y1: l.bottom }));
     // marks drawn on a text line (radical overlines, fraction bars, strike rules) belong to the text, not to a figure
-    const inline = (b) => !b.img && b.y1 - b.y0 < 14 && lines.some((l) => l.top - 3 < b.y1 && b.y0 < l.bottom + 1 &&
+    // (small square dots are plotted points, never text marks)
+    const dot = (b) => b.x1 - b.x0 < 6 && b.y1 - b.y0 > 2 && Math.abs(b.x1 - b.x0 - (b.y1 - b.y0)) < 1.5;
+    const inline = (b) => !b.img && !dot(b) && b.y1 - b.y0 < 14 && lines.some((l) => l.top - 3 < b.y1 && b.y0 < l.bottom + 1 &&
       b.x0 < l.x1 + 2 && b.x1 > l.x0 - 2 && b.x1 - b.x0 < l.x1 - l.x0 + 20);
     let boxes = g.filter((b) => !(skipUnderlines && b.y1 - b.y0 < 1.6 && !b.img) && !inline(b));
     // drop tiny boxes drawn around English question numbers (they sit on text lines)
@@ -373,7 +388,9 @@
       boxes.splice(i, 1, ...parts);
     }
     // ignore trivially small clusters (bullets, boxes around single numbers)
-    const clusters = boxes.filter((b) => b.img || ((b.x1 - b.x0) > 14 && (b.y1 - b.y0) > 10));
+    // (a flat drawing made of several marks — a number line with points or ticks — is a figure, not an underline)
+    const clusters = boxes.filter((b) => b.img || ((b.x1 - b.x0) > 14 && (b.y1 - b.y0) > 10) ||
+      ((b.n || 1) >= 3 && b.x1 - b.x0 > 40 && b.m.some((p) => p.x1 - p.x0 > 40) && b.m.filter((p) => p.x1 - p.x0 < 8).length >= 2));
     // absorb text into clusters
     const bodyH = modeH(lines);
     const labs = pg.labelBoxes;
@@ -386,16 +403,22 @@
         return (lc > cl.raw[3] - 4 && lc < cy - 2) || (lc < cl.raw[1] + 8 && lc > cy + 2);
       });
     };
+    for (const cl of clusters) cl.raw = [cl.x0, cl.y0, cl.x1, cl.y1];
     for (const cl of clusters) {
       cl.lines = new Set();
-      cl.raw = [cl.x0, cl.y0, cl.x1, cl.y1];
       let changed = true, guard = 0;
       while (changed && guard++ < 12) {
         changed = false;
         for (const l of lines) {
           if (cl.lines.has(l)) continue;
-          const onChoiceRow = labs.some((L) => Math.abs((L.y0 + L.y1) / 2 - (l.top + l.bottom) / 2) < 9 && l.x0 > L.x0 && l.x0 - L.x1 < 150);
-          const smallText = !onChoiceRow && (l.h < bodyH - 0.6 || /^[\d\s.,−–\-%°$=+]+$/.test(l.text) ||
+          const sameRow = (a, b) => Math.abs((a.y0 ?? a.top) + (a.y1 ?? a.bottom) - (b.top + b.bottom)) / 2 < 9;
+          // text right after a choice letter is that choice's — unless other text sits between them (a figure's labels beside the choice)
+          const onChoiceRow = labs.some((L) => sameRow(L, l) && l.x0 > L.x0 && l.x0 - L.x1 < 150 &&
+            !lines.some((o) => o !== l && sameRow(L, o) && o.x0 <= L.x0 + 2 && o.x1 < l.x0 - 25));
+          // indented, unpunctuated text right under the drawing: its caption ("machine blade at rest")
+          const caption = l.top >= cl.y1 - 2 && l.top - cl.y1 < 12 && l.x0 >= cl.x0 - 20 && l.x1 <= cl.x1 + 20 && !/[.?!:;]$/.test(l.text.trim()) && l.text.trim().split(/\s+/).length <= 6;
+          const smallText = !onChoiceRow && (l.h < bodyH - 0.6 || /^[\d\s.,−–\-%°$=+]+$/.test(l.text) || caption ||
+            /^(?:[−–-]?[\d.,]+\s+){2,}(?:[a-zA-Z]\s)?$/.test(l.text.trim() + ' ') || // an axis's tick labels ("2 4 6 8 10 x")
             (l.x1 - l.x0 < 60 && l.text.split(' ').length <= 4 && !/[A-Za-z].*[.?!:;]$/.test(l.text) && (l.text.length <= 3 || !/[.?!:;]$/.test(l.text))));
           const m = smallText ? 9 : 2.5;
           const below = smallText ? 14 : m;
@@ -403,6 +426,14 @@
           // tiny label right above a drawing and within its width (axis titles like "y") is part of it
           const axisTitle = l.text.length <= 3 && l.x0 >= cl.x0 - 4 && l.x1 <= cl.x1 + 4 && l.bottom <= cl.y0 + 2 && cl.y0 - l.bottom < 12 && !/^[A-K][.,]$/.test(l.text) && !/[?.:,;]$/.test(l.text);
           if (!inside && !axisTitle) continue;
+          // bare overline/arrow marks below a drawing belong to the text line under them
+          if (/^[_⏜‾⌢↔⟷\s]+$/.test(l.text) && l.top > cl.y1 - 1) continue;
+          // a label between two drawings belongs to the nearer one
+          const gapTo = (r) => Math.max(0, r[1] - l.bottom, l.top - r[3]) + Math.max(0, r[0] - l.x1, l.x0 - r[2]);
+          if (clusters.some((o) => o !== cl && o.raw && gapTo(o.raw) < gapTo(cl.raw) - 1)) continue;
+          // a glyph sitting within a wider text line (an arc drawn over "DEA") is a mark on that text
+          const lc = (l.top + l.bottom) / 2;
+          if (lines.some((o) => o !== l && o.x0 <= l.x0 + 1 && o.x1 >= l.x1 - 1 && o.x1 - o.x0 > 3 * (l.x1 - l.x0) && lc > o.top && lc < o.bottom)) continue;
           if (!axisTitle && crossesLabel(cl, l.top, l.bottom)) continue;
           if (labs.some((L) => l.x0 >= L.x0 && l.x0 - L.x1 < 16 && l.top < L.y1 + 6 && l.bottom > L.y0 - 6)) continue;
           // a body-size line only joins if it is mostly inside horizontally
@@ -456,7 +487,7 @@
     if (labs.length) {
       // never glue together two answer-choice figures: a choice label heading the lower/right box
       const upper = a.y0 <= b.y0 ? a : b, lower = upper === a ? b : a;
-      if (labs.some((L) => L.y0 > upper.y0 + 4 && Math.abs(L.y0 - lower.y0) < 16 && L.x0 < lower.x0 + 12 && L.x0 > lower.x0 - 60)) return false;
+      if (labs.some((L) => L.y0 > upper.y0 + 4 && L.y0 >= upper.y1 - 2 && L.y0 <= lower.y0 + 6 && Math.abs(L.y0 - lower.y0) < 16 && L.x0 < lower.x0 + 12 && L.x0 > lower.x0 - 60)) return false;
       const left = a.x0 <= b.x0 ? a : b, right = left === a ? b : a;
       if (labs.some((L) => L.x0 > left.x0 + 4 && L.x0 < right.x0 + 12 && L.x0 > right.x0 - 60 && Math.abs(L.y0 - right.y0) < 16 && L.y0 < left.y1)) return false;
     }
@@ -512,6 +543,60 @@
     const out = { s, w: c.width, h: c.height, d };
     c.width = c.height = 0;
     return out;
+  }
+
+  // Some booklets right-align numbers with padding glyphs that draw nothing but come through the
+  // text layer as "0" or "," ("00, 5.5" is really "5.5"). Drop a leading run of those when the
+  // page has no ink where they would be.
+  function dropInvisiblePadding(pg) {
+    const ink = pg.ink;
+    if (!ink) return false;
+    const ctx = (dropInvisiblePadding.ctx = dropInvisiblePadding.ctx || document.createElement('canvas').getContext('2d'));
+    const inkIn = (x0, x1, y0, y1) => {
+      const X0 = Math.max(0, Math.floor(x0 * ink.s)), X1 = Math.min(ink.w, Math.ceil(x1 * ink.s));
+      const Y0 = Math.max(0, Math.floor(y0 * ink.s)), Y1 = Math.min(ink.h, Math.ceil(y1 * ink.s));
+      let n = 0;
+      for (let y = Y0; y < Y1; y++) for (let x = X0; x < X1; x++) n += ink.d[y * ink.w + x];
+      return n;
+    };
+    let changed = false;
+    for (const it of pg.items) {
+      if (it.rot || !/[0,]/.test(it.s)) continue;
+      // where each character sits: measured widths scaled to the item's width
+      ctx.font = `${it.h}px ${it.serif ? 'Times New Roman, serif' : 'Helvetica, Arial, sans-serif'}`;
+      const chars = [...it.s];
+      const ws = chars.map((ch) => ctx.measureText(ch).width || it.h * 0.25);
+      const k = it.w / ws.reduce((a, b) => a + b, 0);
+      // spaces can be wide figure spaces, so characters after the last space are placed from the right end
+      const lastSp = chars.map((ch) => /\s/.test(ch)).lastIndexOf(true);
+      const cells = [];
+      let x = it.x;
+      for (let i = 0; i <= lastSp; i++) { cells[i] = [x, x + ws[i] * k]; x += ws[i] * k; }
+      x = it.x + it.w;
+      for (let i = chars.length - 1; i > lastSp; i--) { cells[i] = [x - ws[i] * k, x]; x -= ws[i] * k; }
+      const dead = chars.map((ch, i) => {
+        if (ch !== '0') return false;
+        const [x0, x1] = cells[i];
+        const cx = (x0 + x1) / 2, half = (x1 - x0) * 0.25;
+        return inkIn(cx - half, cx + half, it.y - it.h * 0.68, it.y - it.h * 0.08) === 0;
+      });
+      // a padding comma comes with the padding zeros ("0,11", "000,2")
+      chars.forEach((ch, i) => {
+        if (ch !== ',' || !(dead[i - 1] || dead[i + 1])) return;
+        const [x0, x1] = cells[i];
+        const cx = (x0 + x1) / 2, half = (x1 - x0) * 0.25;
+        if (inkIn(cx - half, cx + half, it.y - it.h * 0.25, it.y + it.h * 0.2) === 0) dead[i] = true;
+      });
+      if (!dead.some(Boolean)) continue;
+      let lead = 0;
+      while (lead < chars.length && (dead[lead] || /\s/.test(chars[lead]))) lead++;
+      if (lead === chars.length) { it.s = ''; changed = true; continue; } // a padding glyph on its own
+      const shift = ws.slice(0, lead).reduce((a, b) => a + b, 0) * k;
+      it.s = chars.map((ch, i) => (dead[i] ? ' ' : ch)).join('').slice(lead).replace(/ {2,}/g, ' ').replace(/\s+$/, '');
+      it.x += shift; it.w -= shift;
+      changed = true;
+    }
+    return changed;
   }
 
   // ---------- quick index (fast, text only) for picking a test out of a big book ----------
@@ -666,7 +751,7 @@
     const toOcr = [...ocrSet].filter((p) => !want || want.has(p));
     if (toOcr.length) {
       if (!TS.ocr) throw new Error('OCR module missing');
-      const res = await TS.ocr.ocrPages(pdf, toOcr, (k, tot, pno) => onProgress && onProgress(0.15 + (k / tot) * 0.8, `Recognizing text on scanned page ${pno} (${k} of ${tot})`));
+      const res = await TS.ocr.ocrPages(pdf, toOcr, (k, tot, pno, msg) => onProgress && onProgress(0.15 + (k / tot) * 0.8, msg || `Recognizing text on scanned page ${pno} (${k} of ${tot})`));
       for (const [pno, r] of res) Object.assign(pages[pno - 1], { items: r.items, gfx: r.gfx, ocr: true });
     }
     await pdf.destroy();
@@ -684,12 +769,20 @@
     const detected = detectSections(pages);
     const mathPages = new Set();
     for (const d of detected) if (d.kind === 'math') for (let p = d.start; p <= d.end; p++) if (!pages[p - 1].stub && !pages[p - 1].ocr) mathPages.add(p);
-    if (mathPages.size) {
+    // other test pages with numbers that may carry invisible padding ("000,1.00" in a science choice)
+    const padPages = new Set();
+    for (const d of detected) for (let p = d.start; p <= d.end; p++) {
+      const pg = pages[p - 1];
+      if (!pg.stub && !pg.ocr && !mathPages.has(p) && pg.items.some((it) => /^[0,]+$|^[0,]+\s*[\d.]|(^|[\s$(])0+[\d,]/.test(it.s.trim()))) padPages.add(p);
+    }
+    if (mathPages.size || padPages.size) {
       const pdf2 = await pdfjsLib.getDocument({ data: data.slice(0) }).promise;
-      for (const p of mathPages) {
+      for (const p of [...mathPages, ...padPages]) {
         const page = await pdf2.getPage(p);
         pages[p - 1].ink = await inkMap(page, 2);
         page.cleanup();
+        if (dropInvisiblePadding(pages[p - 1])) Object.assign(pages[p - 1], prepPage(pages[p - 1]));
+        if (padPages.has(p)) delete pages[p - 1].ink; // only math uses the ink map later
       }
       await pdf2.destroy();
     }
@@ -911,7 +1004,7 @@
     for (let i = 0; i < stream.length; i++) {
       const e = stream[i];
       if (!isLineEl(e) || claimed.has(e)) continue;
-      const m = e.line.text.match(qStartRe);
+      const m = e.line.text.match(qStartRe) || (e._ocr ? e.line.text.match(/^(\d{1,2}),\s+(.*)$/) : null);
       if (!m || +m[1] < expect || +m[1] > expect + (e._ocr ? 15 : 0)) continue;
       const q = buildQuestion(stream, i, +m[1], kind);
       if (!q) continue;
@@ -950,8 +1043,10 @@
             if (kind === 'math') {
               if (cur && cur.blocksEls.length) {
                 // leftover non-question content before this question: shared stimulus
-                const txt = cur.blocksEls.filter((x) => x.type === 'line').map((x) => x.line.text).join(' ');
-                const rm = txt.match(/questions?\s+(\d+)\s*(?:[–—-]|through|and|to)\s*(\d+)/i);
+                // (the "Use the following information…" banner is often a box, i.e. a figure: read the text inside it too)
+                const inFig = (x) => pages[x.page - 1].lines.filter((l) => l.x0 >= x.rect[0] - 2 && l.x1 <= x.rect[2] + 2 && l.top >= x.rect[1] - 2 && l.bottom <= x.rect[3] + 2).map((l) => l.text);
+                const txt = cur.blocksEls.flatMap((x) => (x.type === 'line' ? [x.line.text] : inFig(x))).join(' ');
+                const rm = txt.match(/questions?\s+(\d+)\s*(?:[–—−-]|through|and|to)\s*(\d+)/i);
                 cur.range = rm ? [+rm[1], +rm[2]] : [q.n, q.n];
                 // on scans, stray leftovers are OCR noise — only announced shared stimuli count
                 if (rm || !cur.blocksEls.some((x) => x._ocr)) passages.push(cur);
@@ -983,6 +1078,11 @@
         }
         if (cur && !cur.closed) cur.blocksEls.push(e);
       }
+      // "Questions 11–15 ask about Passage A." boxes are directions for the paper booklet, not passage text
+      const BANNER = /^\s*Questions?\s+\d+\s*(?:[–—−-]|through|and)\s*\d+\s+(?:ask|are)\s+about\b/i;
+      const bannerFig = (x) => x.type === 'fig' && pages[x.page - 1].lines.some((l) => BANNER.test(l.text) &&
+        l.x0 >= x.rect[0] - 2 && l.x1 <= x.rect[2] + 2 && l.top >= x.rect[1] - 2 && l.bottom <= x.rect[3] + 2);
+      for (const p of passages) p.blocksEls = p.blocksEls.filter((x) => !bannerFig(x) && !(x.type === 'line' && BANNER.test(x.line.text)));
       for (const p of passages) p.blocks = elsToBlocks(p.blocksEls, kind);
       if (kind === 'math') {
         // stimuli are cropped whole
@@ -1136,16 +1236,36 @@
   // labels is a question; ACT alternates A–D (odd) and F–J (even), which keeps numbering on track.
   function ladderScan(stream, kind) {
     const labs = [];
-    stream.forEach((e, i) => { if (e.type === 'line') { const L = labelInText(e.line.text); if (L) labs.push({ i, e, L }); } });
+    // English scans: a lone (fuzzy) "NO CHANGE" line is a question header whose number and letter were lost
+    const isNoChange = (e) => kind === 'english' && e._ocr && /^(?:[^A-Za-z]{0,6}\s*)?[NM]O\s*CH[A-Z]{2,4}E\b/i.test(e.line.text.trim());
+    stream.forEach((e, i) => {
+      if (e.type !== 'line') return;
+      const L = labelOfLine(e.line);
+      if (L) labs.push({ i, e, L });
+      else if (isNoChange(e)) {
+        // only when no choice letter follows (otherwise the lettered ladder already is this question)
+        let lettered = false, seen = 0;
+        for (let j = i + 1; j < stream.length && seen < 6; j++) {
+          const o = stream[j];
+          if (o.page !== e.page || o.c !== e.c) break;
+          if (o.type !== 'line') continue;
+          seen++;
+          if (labelOfLine(o.line)) { lettered = true; break; }
+          if (isNoChange(o)) break;
+        }
+        if (!lettered) labs.push({ i, e, L: null, synth: true });
+      }
+    });
     const ladders = [];
     let cur = null;
     for (const x of labs) {
+      if (x.synth) { cur = { ld: null, synth: true, page: x.e.page, col: x.e.c, items: [x], last: 0, first: 0 }; ladders.push(cur); continue; }
       const ld = LADDERS.find((l) => l.includes(x.L));
       const pos = ld.indexOf(x.L);
       if (cur && cur.ld === ld && pos > cur.last && pos - cur.last <= 2 && x.e.page === cur.page && x.e.c === cur.col) { cur.items.push(x); cur.last = pos; }
       else { cur = { ld, page: x.e.page, col: x.e.c, items: [x], last: pos, first: pos }; ladders.push(cur); }
     }
-    const good = ladders.filter((l) => l.items.length >= 2 && l.first <= 1);
+    const good = ladders.filter((l) => l.synth || (l.items.length >= 2 && l.first <= 1));
     // stem start + readable number for each ladder
     for (const ld of good) {
       const firstLab = ld.items[0];
@@ -1157,15 +1277,15 @@
         const bot = e.type === 'fig' ? e.rect[3] : e.line.bottom;
         const h = prev.type === 'line' ? prev.line.h : 8;
         if (prev.top - bot > h * 0.9) break;
-        if (e.type === 'line' && (labelInText(e.line.text) || PASSAGE_RE.test(e.line.text))) break;
+        if (e.type === 'line' && (labelOfLine(e.line) || PASSAGE_RE.test(e.line.text))) break;
         si = j; prev = e;
         if (numbered(e)) break; // reached this question's number
       }
       ld.si = si;
       const st = stream[si];
       const m = st.type === 'line' && st.line.text.match(/^(?:[^A-Za-z\s]{1,4}\s+)?[a-z]{0,2}(\d{1,2})[.,]/);
-      const odd = ld.ld[0] === 'A';
-      ld.r = m && +m[1] >= 1 && (kind === 'math' || (+m[1] % 2 === 1) === odd) ? +m[1] : null;
+      const odd = ld.ld ? ld.ld[0] === 'A' : null;
+      ld.r = m && +m[1] >= 1 && (kind === 'math' || odd == null || (+m[1] % 2 === 1) === odd) ? +m[1] : null;
     }
     // anchors: readable numbers that increase along the stream (longest increasing run)
     const idx = good.map((l, i) => i).filter((i) => good[i].r != null);
@@ -1181,7 +1301,7 @@
     const anchors = new Set();
     while (end >= 0) { anchors.add(idx[end]); end = prevOf[end]; }
     // fill numbers between anchors, honouring the A–D / F–J alternation
-    const fits = (n, ld) => kind === 'math' || (n % 2 === 1) === (ld.ld[0] === 'A');
+    const fits = (n, ld) => kind === 'math' || !ld.ld || (n % 2 === 1) === (ld.ld[0] === 'A');
     let n = 0;
     for (let i = 0; i < good.length; i++) {
       const ld = good[i];
@@ -1218,6 +1338,28 @@
     const numItem = start.line.items[0];
     // candidate elements: same page + column, below start, until next question start / passage heading
     const cands = [];
+    let seenNoChange = /[NM]O\s*CH[A-Z]{2,4}E\b/i.test(start.line.text) || /^[^A-Za-z]{0,6}\s*[A-HJK]?[.,]?\s*$/.test(start.line.text.replace(/^\d{1,2}[.,]\s*/, '').trim());
+    // a line of bare marks (overline bars, ↔ arrows) belongs to the text just below it
+    const markLine = (e) => e && e.type === 'line' && /^[_⏜‾⌢↔⟷←→\s]+$/.test(e.line.text);
+    // …and so do raised pieces of built-up math stacked on that line (an exponent, a fraction's
+    // numerator over its denominator): each touches the line or a piece already taken
+    const boxE = (e) => (e.type === 'fig' ? { x0: e.rect[0], x1: e.rect[2], top: e.rect[1], bottom: e.rect[3] } : e.line);
+    const tiedTo = (e, s, tied) => {
+      if (!e || e.page !== s.page || e.c !== s.c || (e.type !== 'line' && e.type !== 'fig')) return false;
+      const b = boxE(e);
+      if (b.top >= s.line.top) return false;
+      if (markLine(e)) return s.line.top - b.bottom < 8;
+      // (the line may be split around the built-up piece: "…the expression [fraction] simplifies")
+      const rowX1 = Math.max(s.line.x1, ...stream.filter((x) => x.type === 'line' && x.page === s.page && x.c === s.c && Math.abs(x.line.top - s.line.top) < 2.5).map((x) => x.line.x1));
+      if (b.x0 < s.line.x0 + 20 || b.x1 > rowX1 + 4 || b.bottom - b.top > 30 || (e.type === 'line' && e.line.h >= s.line.h)) return false;
+      return [{ x0: s.line.x0, x1: rowX1, top: s.line.top }, ...tied.map(boxE)].some((t) => b.bottom > t.top + 1 && b.x1 > t.x0 - 2 && b.x0 < t.x1 + 2);
+    };
+    // …so such pieces right above this question's first line are part of it
+    {
+      const tied = [];
+      for (let j = i - 1; j >= 0 && tiedTo(stream[j], start, tied); j--) tied.push(stream[j]);
+      cands.push(...tied);
+    }
     for (let j = i + 1; j < stream.length; j++) {
       const e = stream[j];
       if (e.page !== page) break;
@@ -1226,13 +1368,24 @@
       if (e.top < start.top - 1) continue;
       if (e.type === 'line') {
         const m = e.line.text.match(/^(\d{1,2})\.\s/);
-        if (m && (+m[1] === n + 1 || +m[1] === n)) break; // a second "n." means this start was a look-alike (e.g. a numbered directions note)
+        // scans: any later question header ends this question, even when the exact next number was lost
+        if (start._ocr && kind === 'english' && /^(?:[^A-Za-z]{0,6}\s*)?[NM]O\s*CH[A-Z]{2,4}E\b/i.test(e.line.text.trim())) {
+          if (seenNoChange) break;
+          seenNoChange = true;
+        }
+        if (start._ocr && !m) { const m2 = e.line.text.match(/^(\d{1,2})[.,]\s+\S/); if (m2 && +m2[1] > n && +m2[1] <= n + 8) break; }
+        if (m && (+m[1] === n + 1 || +m[1] === n || (start._ocr && +m[1] > n && +m[1] <= n + 8))) {
+          // …and marks right above the next question's first line are not part of this one
+          const tied = [];
+          while (cands.length && tiedTo(cands[cands.length - 1], e, tied)) tied.push(cands.pop());
+          break; // a second "n." means this start was a look-alike (e.g. a numbered directions note)
+        }
         if (PASSAGE_RE.test(e.line.text) && e.line.text.length < 40) break;
       }
       cands.push(e);
     }
     // choice labels
-    const labelOf = (line) => labelInText(line.text);
+    const labelOf = (line) => labelOfLine(line);
     // also allow first choice on the start line: "1. A. NO CHANGE"
     const startRest = start.line.text.replace(/^\d{1,2}\.\s*/, '').replace(start._ocr ? JUNK_LEAD : /^$/, '');
     const inlineL = labelInText(start.line.text);
@@ -1242,6 +1395,8 @@
     if (inlineFirst) { ladder = LADDERS.find((l) => l[0] === inlineFirst[1]); want = 1; choiceStarts.push({ el: start, L: inlineFirst[1], inline: true }); }
     let lastIdx = -1;
     let labelEls = cands.map((e, k) => ({ e, k, L: e.type === 'line' ? labelOf(e.line) : null })).filter((x) => x.L);
+    // scans: the first letter read decides the set (an F–J question whose F, G, H were lost starts with its J, not the next question's A)
+    if (!ladder && pagesOcr(start) && labelEls.length) ladder = LADDERS.find((l) => l.includes(labelEls[0].L)) || null;
     if (!ladder) { const f = labelEls.find((x) => LADDERS.some((l) => l[0] === x.L)); if (f) ladder = LADDERS.find((l) => l[0] === f.L); }
     if (ladder) {
       // stop at the next question's ladder (the other letter set)
@@ -1254,6 +1409,12 @@
       const ld = LADDERS.find((l) => labelEls.filter((x) => l.includes(x.L)).length >= 3);
       if (ld && /^(NO CHANGE|No Change)\b/.test(startRest)) { ladder = ld; want = 1; choiceStarts.push({ el: start, L: ld[0], inline: true }); }
     }
+    if (ladder && kind !== 'math') ladder = ladder.slice(0, 4); // only Math has a fifth choice
+    // scans: a ladder known only from later letters (the first ones lost): H and J imply F–J
+    if (!ladder && pagesOcr(start)) {
+      const ld = LADDERS.find((l) => labelEls.filter((x) => l.slice(0, 4).includes(x.L)).length >= 2);
+      if (ld) ladder = ld;
+    }
     if (ladder) {
       for (let w = want; w < ladder.length; w++) {
         const f = labelEls.find((x) => x.L === ladder[w] && !choiceStarts.some((c) => c.el === x.e));
@@ -1263,29 +1424,59 @@
       }
     }
     // labels lost or garbled by OCR: choices start at the label column, so recover them by position
-    if (ladder && choiceStarts.length >= 1 && choiceStarts.length < 4 && pagesOcr(start)) {
-      const found = choiceStarts.filter((c) => !c.inline);
-      const lx = found.length ? found.map((c) => c.el.line.x0).sort((a, b) => a - b)[found.length >> 1] : null;
-      const firstY = found.length ? Math.min(...found.map((c) => c.el.top)) : start.top;
-      if (lx != null) {
+    if (ladder && choiceStarts.length < ladder.length && pagesOcr(start)) {
+      // every label we did read, in ladder order (not just an unbroken run from the first letter)
+      let known = choiceStarts.filter((c) => c.inline).concat(
+        labelEls.filter((x) => ladder.includes(x.L)).reduce((acc, x) => {
+          if (!acc.length || ladder.indexOf(x.L) > ladder.indexOf(acc[acc.length - 1].L)) acc.push({ el: x.e, L: x.L, k: x.k });
+          return acc;
+        }, []));
+      const found = known.filter((c) => !c.inline);
+      if (found.length) {
+        const lx = found.map((c) => c.el.line.x0).sort((a, b) => a - b)[found.length >> 1];
+        const firstKnownY = Math.min(...found.map((c) => c.el.top));
         const colRight = Math.max(...stream.filter((e) => e.type === 'line' && e.page === page && e.c === col).map((e) => e.line.x1));
         const lineEls = cands.filter((e) => e.type === 'line');
-        // a line indented to the text column is a new choice (whose label was lost) when the line
-        // above it is short — i.e. it can't be a wrapped continuation
-        const prevShort = (e) => {
+        // how likely a line is to start a new choice: the line above stops well short of the margin or ends a phrase
+        const startScore = (e) => {
           const i = lineEls.indexOf(e);
           const p = i > 0 ? lineEls[i - 1] : null;
-          return p && p.line.x1 < colRight - 0.3 * (colRight - lx);
+          if (!p) return 0;
+          return (colRight - p.line.x1 > 20 ? colRight - p.line.x1 : 0) + (/[.,;?!]["”’]?$/.test(p.line.text.trim()) ? 40 : 0);
         };
-        const rows = cands.filter((e) => {
-          if (e.top <= firstY + 1 || choiceStarts.some((c) => c.el === e)) return false;
+        // the next question's first line (number lost by OCR) sticks out left of the choice letters: stop there
+        const nextQ = lineEls.find((e) => e !== start && e.top > start.top + 12 && e.line.x0 < lx - 4 && e.line.x0 > lx - 22 && !labelOfLine(e.line));
+        const rows = [];
+        // typical distance between consecutive lines of this block
+        const gaps = lineEls.slice(1).map((e, i) => e.top - lineEls[i].top).filter((g) => g > 3 && g < 16).sort((a, b) => a - b);
+        const pitch = gaps.length ? gaps[gaps.length >> 1] : 0;
+        let firstIndentSeen = false;
+        // below the first indented (text-column) line nothing is stem any more: letter-column lines there are choices
+        const indentTop = (cands.find((e) => e.type === 'line' && e.top > start.top + 8 && e.line.x0 - lx > 5 && e.line.x0 - lx <= 22 && !(nextQ && e.top >= nextQ.top - 1)) || { top: Infinity }).top;
+        const labelFrom = Math.min(firstKnownY, indentTop);
+        for (const e of cands) {
+          if (e.top <= start.top + 8 || known.some((c) => c.el === e) || (nextQ && e.top >= nextQ.top - 1)) continue;
           const x0 = e.type === 'fig' ? e.rect[0] : e.line.x0;
-          if (Math.abs(x0 - lx) <= 5) return true;
-          return e.type === 'line' && x0 - lx > 5 && x0 - lx <= 22 && prevShort(e);
-        });
-        const all = [...choiceStarts.map((c) => ({ el: c.el, inline: c.inline, top: c.inline ? -1 : c.el.top, known: true })), ...rows.map((e) => ({ el: e, top: e.top }))]
+          if (Math.abs(x0 - lx) <= 5 && e.top > labelFrom + 1) rows.push({ el: e, top: e.top, score: 1000 });
+          // a letter-column line above any letter we read: a first choice (letter lost) if the stem ends just before it with a visible gap
+          else if (Math.abs(x0 - lx) <= 5 && e.type === 'line' && e.top <= labelFrom + 1 && pitch && lineEls.indexOf(e) > 0 &&
+            e.top - lineEls[lineEls.indexOf(e) - 1].top >= pitch * 1.18 && !rows.some((r) => r.score >= 1000)) rows.push({ el: e, top: e.top, score: 900 });
+          else if (e.type === 'line' && x0 - lx > 5 && x0 - lx <= 22) {
+            let sc = startScore(e);
+            // the first line at the text indent below the stem (and above any letter we read) starts the first choice:
+            // stem continuations sit at the letter column, never at the text column
+            if (!firstIndentSeen && e.top < firstKnownY) sc += 500;
+            firstIndentSeen = true;
+            if (sc > 0) rows.push({ el: e, top: e.top, score: sc });
+          }
+        }
+        const need = ladder.length - known.length;
+        // too many candidates: keep the ones that look most like choice starts
+        const pick = rows.length > need ? [...rows].sort((a, b) => b.score - a.score).slice(0, need) : rows;
+        const all = [...known.map((c) => ({ el: c.el, inline: c.inline, top: c.inline ? -1 : c.el.top, known: true })), ...pick.map((r) => ({ el: r.el, top: r.top }))]
           .sort((a, b) => a.top - b.top);
-        if (all.length === 4 || all.length === 5) {
+        if (window.__dbgOn) (window.__dbg = window.__dbg || []).push({ n, labels: labelEls.map((x) => x.L).join(''), ladder: ladder.join(''), known: known.map((c) => c.L), rows: rows.map((r) => [Math.round(r.top), Math.round(r.score)]), picked: pick.length, all: all.length, lx, need });
+        if (all.length === ladder.length) {
           choiceStarts.length = 0;
           all.forEach((r, i) => {
             if (r.el.type === 'fig' && !r.el.line) {
@@ -1299,7 +1490,8 @@
       }
     }
     // English "N. NO CHANGE" questions whose other labels OCR lost entirely: rows by layout
-    if (choiceStarts.length < 4 && pagesOcr(start) && /^(?:[A-HJK][.,]\s*)?NO CHANGE\b/i.test(startRest)) {
+    // (the first choice may also have lost its text: the number line then holds nothing, or just its letter)
+    if (choiceStarts.length < 4 && pagesOcr(start) && kind === 'english' && /^(?:[A-HJK][.,]?\s*)?(?:NO CHANGE\b.*)?$/i.test(startRest.trim())) {
       const block = [];
       let prevB = start.line.bottom;
       for (const e of cands) {
@@ -1362,10 +1554,24 @@
     const stemEls = [], choiceEls = labels.map(() => []);
     const bodyHq = modeH(q.els.filter((e) => e.type === 'line').map((e) => e.line));
     const boxOf = (e) => (e.type === 'fig' ? { x0: e.rect[0], top: e.rect[1] } : { x0: e.line.x0, top: e.line.top });
+    // a tall bracket right after a label (piecewise-function brace, matrix bracket) holds that choice's rows
+    const spans = labels.map((c) => {
+      const L = c.el.line;
+      if (!L || c.inline) return null;
+      const ly = (L.top + L.bottom) / 2;
+      let lo = Infinity, hi = -Infinity;
+      for (const e of q.els) if (e.type === 'line' && e.page === c.el.page) for (const it of e.line.items) {
+        if (it.h >= bodyHq * 1.8 && it.top < ly && it.bottom > ly && it.x >= L.x0 && it.x < L.x0 + 45) { lo = Math.min(lo, it.top); hi = Math.max(hi, it.bottom); }
+      }
+      return lo < hi ? [lo, hi] : null;
+    });
     for (const e of q.els) {
       if (e === q.start && !labels[0].inline) { stemEls.push(e); continue; }
       const li = labels.findIndex((c) => c.el === e);
       if (li >= 0) { choiceEls[li].push(e); continue; }
+      const cyE = e.type === 'fig' ? (e.rect[1] + e.rect[3]) / 2 : (e.line.top + e.line.bottom) / 2;
+      const si = spans.findIndex((sp, k) => sp && e.page === labels[k].el.page && cyE > sp[0] && cyE < sp[1] && boxOf(e).x0 > labels[k].el.line.x0);
+      if (si >= 0) { choiceEls[si].push(e); continue; }
       // owner = the label whose line is vertically nearest this element's centre (labels sit at the
       // middle of tall math choices and at the top of figure choices), preferring labels to the left
       const b = boxOf(e);
@@ -1381,7 +1587,9 @@
       const stemLine = e.type === 'line' && e.line.top < firstTop - 1 && e.line.x0 <= minLX + 4;
       // a line of bare "_" glyphs is an overline/vinculum for the text just below it
       const bar = e.type === 'line' && /^[_⏜‾⌢\s]+$/.test(e.line.text);
-      if ((bot > firstTop + 1 || (bar && bot + 7 > firstTop)) && !startsAbove && !stemLine) {
+      // a superscript piece (small type) just above the first choice and right of its label is part of it
+      const supAbove = e.type === 'line' && e.line.h < bodyHq * 0.9 && bot + 5 > firstTop && e.line.x0 > minLX + 10;
+      if ((bot > firstTop + 1 || (bar && bot + 7 > firstTop) || supAbove) && !startsAbove && !stemLine) {
         const cy = e.type === 'fig' ? (e.rect[1] + e.rect[3]) / 2 : bar ? e.line.bottom + 7 : (e.line.top + e.line.bottom) / 2;
         const pick = (useX) => {
           let best = -1, bd = Infinity;
@@ -1414,9 +1622,13 @@
       }
       if (idx < 0) stemEls.push(e); else choiceEls[idx].push(e);
     }
+    // (a header whose number was lost by OCR has nothing to strip)
+    const numberedStart = /^(?:[^A-Za-z\s]{1,4}\s+|[a-z]{0,2}\d{1,2}[.,]|[A-K][.,])/.test(q.start.line.text);
     const stemHasFig = stemEls.some((e) => e.type === 'fig');
     const out = { n: q.n, passage: q.passage ?? null, answer: null, page: q.page };
-    const cropStem = kind === 'math' && !mathSafe(stemEls, pages, q.numItem);
+    // scanned stem with several words the OCR wasn't sure of: show the scan itself
+    const shakyStem = stemEls.reduce((n, e) => n + (e.type === 'line' ? e.line.items.filter((it) => it.ocr && it.conf < 50 && it !== q.numItem).length : 0), 0) >= 2;
+    const cropStem = (kind === 'math' && !mathSafe(stemEls, pages, q.numItem)) || shakyStem;
     // stem content
     if (cropStem) {
       out.stem = cropBlocks(stemEls, { startEl: q.start, pages });
@@ -1443,7 +1655,7 @@
         blocks = cropBlocks(els, { pages, dropLabel: true, startEl: c.inline ? q.start : null, startRe: /^\d{1,2}\.\s*(?:[A-K][.,]\s*)?/ });
       } else {
         const lines = els.map((e) => {
-          if (c.inline && e === q.start) return { ...e, line: stripLead(e.line, /^(?:[^A-Za-z\s]{1,4}\s+)?(?:[a-z]{0,2}\d{1,2}[.,]\s*)?(?:[A-K][.,]\s*)?/) };
+          if (c.inline && e === q.start) return { ...e, line: numberedStart ? stripLead(e.line, /^(?:[^A-Za-z\s]{1,4}\s+)?(?:[a-z]{0,2}\d{1,2}[.,]\s*)?(?:[A-K][.,]\s*)?/) : e.line };
           if (e === c.el) return { ...e, line: stripLead(e.line, /^(?:[^A-Za-z\s]{1,4}\s+)?[A-K][.,]\s*/) };
           return e;
         });
@@ -1452,6 +1664,43 @@
       }
       return { L: c.L, blocks };
     });
+    // choices laid out as a grid of figures (2 columns): when the drawings couldn't be split
+    // cleanly (one image holds two choices, or a choice got nothing), crop each grid cell instead
+    {
+      const Ls = labels.map((c) => c.el.line);
+      const xs = [...new Set(Ls.map((L) => Math.round(L.x0 / 20)))];
+      const allFig = out.choices.every((c) => !c.blocks.length || c.blocks.every((b) => b.t === 'fig'));
+      const samePage = labels.every((c) => c.el.page === labels[0].el.page) && !labels.some((c) => c.inline);
+      const rects = out.choices.map((c) => c.blocks.find((b) => b.t === 'fig'));
+      const clash = rects.some((r, k) => !r || rects.some((o, j) => j !== k && o && o.page === r.page &&
+        Math.min(r.rect[2], o.rect[2]) - Math.max(r.rect[0], o.rect[0]) > 10 && Math.min(r.rect[3], o.rect[3]) - Math.max(r.rect[1], o.rect[1]) > 10));
+      // (really side by side: two letters share a row, well apart, and both are bare labels)
+      const sideBySide = Ls.some((L) => Ls.some((M) => M !== L && Math.abs(M.top - L.top) < 8 && M.x0 > L.x0 + 60 && L.x1 - L.x0 < 40));
+      if (xs.length >= 2 && allFig && samePage && clash && sideBySide) {
+        const pg = labels[0].el.page;
+        const area = rectOf(q.els.filter((e) => e.page === pg));
+        out.choices = labels.map((c, k) => {
+          const L = Ls[k];
+          const right = Ls.filter((M) => M !== L && Math.abs(M.top - L.top) < 8 && M.x0 > L.x0 + 30).sort((a, b) => a.x0 - b.x0)[0];
+          const below = Ls.filter((M) => M !== L && M.top > L.top + 8 && Math.abs(M.x0 - L.x0) < 30).sort((a, b) => a.top - b.top)[0];
+          const x1 = right ? right.x0 - 3 : area[2] + 2;
+          const y1 = below ? below.top - 3 : area[3] + 2;
+          return { L: c.L, blocks: [{ t: 'fig', fromFig: true, page: pg, rect: [L.x1 + 2, L.top - 8, x1, y1].map((v) => Math.round(v * 10) / 10) }] };
+        });
+      }
+    }
+    // math choices laid out as a table (columns under headers): when most have to be images,
+    // show them all as images so the columns still line up
+    if (kind === 'math') {
+      const isCrop = (c) => c.blocks.length && c.blocks.every((b) => b.t === 'fig');
+      const nCrop = out.choices.filter(isCrop).length;
+      if (nCrop >= 2 && nCrop >= out.choices.length / 2 && nCrop < out.choices.length) {
+        out.choices.forEach((ch, k) => {
+          if (isCrop(ch) || labels[k].inline || !choiceEls[k].length) return;
+          ch.blocks = cropBlocks(choiceEls[k], { pages, dropLabel: true });
+        });
+      }
+    }
     // keep each choice's image between its neighbours' text (tall symbol glyphs, like an arc over
     // "TXU", report boxes much bigger than their ink)
     const textEdge = (els, which) => {
@@ -1462,7 +1711,7 @@
       }
       return v;
     };
-    out.choices.forEach((c, k) => {
+    if (!pagesOcr(q.start)) out.choices.forEach((c, k) => {
       const above = k === 0 ? stemEls : choiceEls[k - 1];
       const below = k + 1 < labels.length ? choiceEls[k + 1] : null;
       const lo = textEdge(above, 'bottom'), hi = below ? textEdge(below, 'top') : Infinity;
@@ -1560,7 +1809,7 @@
       if (need <= 0) { items.push(it); continue; }
       const s = it.s.replace(/^\s+/, '');
       const lead = it.s.length - s.length;
-      if (s.length <= need - 0 && /^[\dA-K.\s]+$/.test(s)) { need -= s.length; if (need > 0 && need <= 1) need = 0; continue; }
+      if (s.length <= need - 0 && /^[\dA-K.\s]+$/.test(s)) { need -= s.length; if (it.ocr && need > 0) need -= 1; /* OCR words carry no space items: count the gap */ if (need > 0 && need <= 1) need = 0; continue; }
       // partial item
       const cut = Math.min(s.length, need);
       const rest = s.slice(cut).replace(/^\s+/, '');
@@ -1585,6 +1834,9 @@
     return [x0, y0, x1, y1];
   }
 
+  const overlaps = (a, b) => Math.min(a[2], b[2]) - Math.max(a[0], b[0]) > 2 && Math.min(a[3], b[3]) - Math.max(a[1], b[1]) > 0.5;
+  const unionRect = (a, b) => [Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.max(a[2], b[2]), Math.max(a[3], b[3])];
+
   // Crop blocks: group consecutive elements on the same page into one rectangle.
   function cropBlocks(els, opts = {}) {
     const blocks = [];
@@ -1603,7 +1855,13 @@
       if (opts.fromX != null) r[0] = Math.max(r[0], opts.fromX);
       // figures get their own crop: a box around text + a side figure would also swallow whatever
       // sits beside the figure (e.g. the answer choices)
-      if (e.type === 'fig') { cur = null; blocks.push({ t: 'fig', page: e.page, rect: r, fromFig: true }); continue; }
+      if (e.type === 'fig') {
+        cur = null;
+        const prev = blocks[blocks.length - 1];
+        if (prev && prev.fromFig && prev.page === e.page && overlaps(prev.rect, r)) prev.rect = unionRect(prev.rect, r);
+        else blocks.push({ t: 'fig', page: e.page, rect: r, fromFig: true });
+        continue;
+      }
       if (cur && !cur.fromFig && cur.page === e.page && r[1] - cur.rect[3] < 40) {
         cur.rect = [Math.min(cur.rect[0], r[0]), Math.min(cur.rect[1], r[1]), Math.max(cur.rect[2], r[2]), Math.max(cur.rect[3], r[3])];
       } else {
@@ -1635,12 +1893,15 @@
     if (opts.pages) for (const b of blocks) {
       if (b.fromFig) continue;
       const g = opts.pages[b.page - 1].g;
+      const grow = (r, s) => { r[0] = Math.min(r[0], s.x0); r[1] = Math.min(r[1], s.y0); r[2] = Math.max(r[2], s.x1); r[3] = Math.max(r[3], s.y1); };
       for (let pass = 0; pass < 2; pass++) for (const s of g) {
-        if (s.y1 - s.y0 > 1.8 || s.x1 - s.x0 > 200) continue;
         const r = b.rect;
-        if (s.x0 < r[2] && s.x1 > r[0] && s.y1 > r[1] - 6 && s.y0 < (r[1] + r[3]) / 2) {
-          r[0] = Math.min(r[0], s.x0); r[1] = Math.min(r[1], s.y0); r[2] = Math.max(r[2], s.x1); r[3] = Math.max(r[3], s.y1);
-        }
+        // drawn matrix brackets: thin vertical strokes hugging the text's left/right edge, and their short hooks
+        if (s.x1 - s.x0 < 1.8 && s.y1 - s.y0 > 6 && s.y1 - s.y0 < 80 && (Math.abs(s.x0 - r[0]) < 7 || Math.abs(s.x1 - r[2]) < 7) &&
+          Math.min(s.y1, r[3]) - Math.max(s.y0, r[1]) > 0.5 * Math.min(s.y1 - s.y0, r[3] - r[1])) { grow(r, s); continue; }
+        if (pass && s.y1 - s.y0 < 1.8 && s.x1 - s.x0 < 6 && s.x0 < r[2] + 1 && s.x1 > r[0] - 1 && s.y0 > r[1] - 2 && s.y1 < r[3] + 2) { grow(r, s); continue; }
+        if (s.y1 - s.y0 > 1.8 || s.x1 - s.x0 > 200) continue;
+        if (s.x0 < r[2] && s.x1 > r[0] && s.y1 > r[1] - 6 && s.y0 < (r[1] + r[3]) / 2) grow(r, s);
       }
     }
     for (const b of blocks) b.rect = [b.rect[0] - 2, b.rect[1] - (b.fromFig ? 3.5 : 1.5), b.rect[2] + 2, b.rect[3] + 1].map((v) => Math.round(v * 10) / 10);
@@ -1691,7 +1952,11 @@
         const after = els.slice(i + 1).find((x) => x.type === 'line' && x.page === e.page);
         if (before && before.line.bottom <= e.rect[1] + 1) r[1] = Math.max(r[1], before.line.bottom + 0.5);
         if (after && after.line.top >= e.rect[3] - 1) r[3] = Math.min(r[3], after.line.top - 0.5);
-        blocks.push({ t: 'fig', page: e.page, rect: r.map((v) => Math.round(v * 10) / 10) });
+        const rr = r.map((v) => Math.round(v * 10) / 10);
+        // overlapping pieces of one drawing (a shaded segment over its number line) make one crop
+        const prev = blocks[blocks.length - 1];
+        if (prev && prev.t === 'fig' && prev.page === e.page && overlaps(prev.rect, rr)) prev.rect = unionRect(prev.rect, rr);
+        else blocks.push({ t: 'fig', page: e.page, rect: rr });
         continue;
       }
       const l = e.line;
@@ -1717,7 +1982,8 @@
       const text = lineText(items);
       const allBold = items.every((i) => i.bold || !i.s.trim());
       const centered = !indent ? false : false;
-      const bullet = /^[•●▪◦]\s*/.test(text);
+      // list items ("I. …", "(1) …") hang like bullets: their wrapped lines are indented under the text
+      const bullet = /^[•●▪◦]\s*/.test(text) || (opts.question && /^(?:[IVX]{1,4}\.|\(\d{1,2}\)|\d{1,2}\))\s/.test(text));
       const otherFamily = items.every((i) => i.serif !== bodySerif || !i.s.trim()) && text.split(' ').length <= 12 && l.h >= bodyH * 0.9;
       const heading = ((allBold || (otherFamily && !opts.question)) && text.length < 70 && !opts.choice) || (/^\[\d+\]$/.test(text)) ||
         (!opts.question && /^Passage [A-D](\s+by\b.*)?$/.test(text));
@@ -1976,5 +2242,5 @@
     return l.h <= 7.6 * k && l.items.every((i) => /^\s*\d{1,2}(\s+\d{1,2})*\s*$/.test(i.s));
   }
 
-  TS.parser = { VERSION: 7, parsePdf, analyzePdf, scanPdf, buildSection, guessKind: (ctx) => guessKind(ctx.pages), parseKeyText, KINDS, KIND_NAMES, runsText, _dev: { extractPage, prepPage, buildClusters, pageStream, buildQuestion, strayInk, inkMap } };
+  TS.parser = { VERSION: 11, parsePdf, analyzePdf, scanPdf, buildSection, guessKind: (ctx) => guessKind(ctx.pages), parseKeyText, KINDS, KIND_NAMES, runsText, _dev: { ladderScan, finalizeQuestion, extractPage, prepPage, buildClusters, pageStream, buildQuestion, strayInk, inkMap } };
 })();

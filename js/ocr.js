@@ -10,7 +10,7 @@
   const A = 2;          // scale for pixel analysis
   // one Tesseract worker per spare pair of cores (each holds ~100 MB)
   const WORKERS = Math.max(2, Math.min(4, Math.floor((navigator.hardwareConcurrency || 4) / 2)));
-  const VERSION = 2; // bump when recognition output changes (item sizing below doesn't need a bump) // bump when recognition output changes
+  const VERSION = 3; // bump when recognition output changes (item sizing below doesn't need a bump) // bump when recognition output changes
   let loading = null;
   let pool = null;
 
@@ -44,44 +44,149 @@
   async function ocrPage(page, worker) {
     const vp = page.getViewport({ scale: 1 });
     const W = vp.width, H = vp.height;
+    const T0 = performance.now();
     const big = await renderPage(page, SCALE);
-    const r = await worker.recognize(big, {}, { blocks: true, text: false });
     const words = [];
-    for (const b of r.data.blocks || []) for (const p of b.paragraphs) for (const l of p.lines) for (const w of l.words) words.push({ w, l });
+    const bands = columnBands(big, W, H);
+    if (!bands) {
+      const r = await worker.recognize(big, {}, { blocks: true, text: false });
+      for (const b of r.data.blocks || []) for (const p of b.paragraphs) for (const l of p.lines) for (const w of l.words) words.push({ w, l });
+    } else {
+      // two-column page: Tesseract's own page layout loses words at line starts on these scans, so read
+      // each column of each band on its own (bands that something crosses, like a heading, are read whole)
+      await worker.setParameters({ tessedit_pageseg_mode: '4' });
+      for (const bd of bands) {
+        const parts = bd.split ? [[0, bd.gx], [bd.gx, W]] : [[0, W]];
+        for (const [x0, x1] of parts) words.push(...(await readRegion(worker, big, x0 * SCALE, bd.y0 * SCALE, (x1 - x0) * SCALE, (bd.y1 - bd.y0) * SCALE)));
+      }
+      await worker.setParameters({ tessedit_pageseg_mode: '3' });
+    }
     // compact raw words: [text, x0, y0, x1, y1, baselineY, conf, rowHeight, italic, bold] in render pixels
     const rawOf = () => words.map(({ w, l }) => [w.text, w.bbox.x0, w.bbox.y0, w.bbox.x1, w.bbox.y1,
       (w.baseline && w.baseline.has_baseline ? w.baseline.y0 : l.baseline.y0), Math.round(w.confidence), l.rowAttributes.row_height, w.is_italic ? 1 : 0, w.is_bold ? 1 : 0]);
+    const T1 = performance.now();
     let gfx = inkGraphics(big, words, W, H);
     // second pass: text-sized ink the page-level layout analysis skipped (very short lines such as
     // "J. If") gets re-read as a small text block
     const holes = gfx.filter((g) => g.ink && g.y1 - g.y0 < 40 && g.x1 - g.x0 > 6 && (g.x1 - g.x0) * (g.y1 - g.y0) < 5000);
-    if (holes.length && holes.length < 40) {
+    if (holes.length && holes.length < 80) {
       await worker.setParameters({ tessedit_pageseg_mode: '6' });
       let added = 0;
+      const keep = (w, l, left, top, dx, dy) => {
+        if (!(w.confidence >= 60 && w.text.trim())) return;
+        const shift = (bb) => ({ x0: bb.x0 + dx, x1: bb.x1 + dx, y0: bb.y0 + dy, y1: bb.y1 + dy });
+        const bl = (o) => o && { ...o, y0: o.y0 + dy, y1: o.y1 + dy };
+        words.push({ w: { ...w, bbox: shift(w.bbox), baseline: bl(w.baseline) }, l: { ...l, bbox: shift(l.bbox), baseline: bl(l.baseline) } });
+        added++;
+      };
+      // each leftover region is a few words: cut them all out and stack them in ONE image (a gap of
+      // white between), so the page costs a single recognition instead of one request per region
+      const cuts = [];
       for (const g of holes) {
-        // recognize a small crop: passing the whole page with a `rectangle` re-sends the full
-        // ~10 MP bitmap to the worker every time (~200 ms per hole)
         const left = Math.max(0, Math.round(g.x0 * SCALE - 8)), top = Math.max(0, Math.round(g.y0 * SCALE - 8));
         const width = Math.min(big.width - left, Math.round((g.x1 - g.x0) * SCALE + 16)), height = Math.min(big.height - top, Math.round((g.y1 - g.y0) * SCALE + 16));
-        if (width < 4 || height < 4) continue;
-        const crop = document.createElement('canvas');
-        crop.width = width; crop.height = height;
-        crop.getContext('2d').drawImage(big, left, top, width, height, 0, 0, width, height);
-        const rr = await worker.recognize(crop, {}, { blocks: true, text: false });
-        const shift = (bb) => ({ x0: bb.x0 + left, x1: bb.x1 + left, y0: bb.y0 + top, y1: bb.y1 + top });
+        if (width >= 4 && height >= 4) cuts.push({ left, top, width, height });
+      }
+      if (TS.ocr && TS.ocr.legacyHoles) {
+        for (const c of cuts) {
+          const crop = document.createElement('canvas');
+          crop.width = c.width; crop.height = c.height;
+          crop.getContext('2d').drawImage(big, c.left, c.top, c.width, c.height, 0, 0, c.width, c.height);
+          const rr = await worker.recognize(crop, {}, { blocks: true, text: false });
+          for (const b of rr.data.blocks || []) for (const p of b.paragraphs) for (const l of p.lines) for (const w of l.words) keep(w, l, c.left, c.top, c.left, c.top);
+        }
+      } else if (cuts.length) {
+        const GAP = 28, PAD = 8;
+        const maxW = Math.max(...cuts.map((c) => c.width));
+        let y = PAD;
+        for (const c of cuts) { c.off = y; y += c.height + GAP; }
+        const sheet = document.createElement('canvas');
+        sheet.width = maxW + 2 * PAD; sheet.height = y;
+        const sx = sheet.getContext('2d');
+        sx.fillStyle = '#fff'; sx.fillRect(0, 0, sheet.width, sheet.height);
+        for (const c of cuts) sx.drawImage(big, c.left, c.top, c.width, c.height, PAD, c.off, c.width, c.height);
+        const rr = await worker.recognize(sheet, {}, { blocks: true, text: false });
+        sheet.width = sheet.height = 0;
         for (const b of rr.data.blocks || []) for (const p of b.paragraphs) for (const l of p.lines) for (const w of l.words) {
-          if (w.confidence >= 60 && w.text.trim()) {
-            const bl = (o) => o && { ...o, y0: o.y0 + top, y1: o.y1 + top };
-            words.push({ w: { ...w, bbox: shift(w.bbox), baseline: bl(w.baseline) }, l: { ...l, bbox: shift(l.bbox), baseline: bl(l.baseline) } });
-            added++;
-          }
+          // which cut a word came from: by its vertical centre on the sheet
+          const cy = (w.bbox.y0 + w.bbox.y1) / 2;
+          const c = cuts.find((k) => cy >= k.off - GAP / 2 && cy < k.off + k.height + GAP / 2);
+          if (c) keep(w, l, c.left, c.top, c.left - PAD, c.top - c.off);
         }
       }
       await worker.setParameters({ tessedit_pageseg_mode: '3' });
       if (added) gfx = inkGraphics(big, words, W, H);
     }
+    if (TS.ocr && TS.ocr.stats) TS.ocr.stats.push({ recMs: Math.round(T1 - T0), holesMs: Math.round(performance.now() - T1), holes: holes.length, words: words.length, bands: bands ? bands.length : 0 });
     big.width = big.height = 0; // release the bitmap right away (these are ~30 MB each)
     return { raw: rawOf(), gfx };
+  }
+
+  // Recognize one rectangle of the page (render pixels); word boxes come back in page pixels.
+  async function readRegion(worker, big, left, top, width, height) {
+    left = Math.max(0, Math.round(left)); top = Math.max(0, Math.round(top));
+    width = Math.min(big.width - left, Math.round(width)); height = Math.min(big.height - top, Math.round(height));
+    if (width < 8 || height < 8) return [];
+    const crop = document.createElement('canvas');
+    crop.width = width; crop.height = height;
+    crop.getContext('2d').drawImage(big, left, top, width, height, 0, 0, width, height);
+    const rr = await worker.recognize(crop, {}, { blocks: true, text: false });
+    crop.width = crop.height = 0;
+    const shift = (bb) => ({ x0: bb.x0 + left, x1: bb.x1 + left, y0: bb.y0 + top, y1: bb.y1 + top });
+    const bl = (o) => o && { ...o, y0: o.y0 + top, y1: o.y1 + top };
+    const out = [];
+    for (const b of rr.data.blocks || []) for (const p of b.paragraphs) for (const l of p.lines) for (const w of l.words) {
+      if (!w.text.trim()) continue;
+      out.push({ w: { ...w, bbox: shift(w.bbox), baseline: bl(w.baseline) }, l: { ...l, bbox: shift(l.bbox), baseline: bl(l.baseline) } });
+    }
+    return out;
+  }
+
+  // Two-column layout: find the gutter (a narrow, nearly empty vertical strip near the middle; the
+  // right column's line numbers may sit in it) and cut the page into horizontal bands — split where
+  // the gutter is clear, whole where something (a heading, a wide figure) crosses it. Points; null = one column.
+  function columnBands(big, W, H) {
+    const c = document.createElement('canvas');
+    c.width = Math.round(W); c.height = Math.round(H);
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(big, 0, 0, c.width, c.height);
+    const d = ctx.getImageData(0, 0, c.width, c.height).data;
+    c.width = c.height = 0;
+    const w = Math.round(W), h = Math.round(H);
+    const dark = (x, y) => d[(y * w + x) * 4] < 140;
+    const ya = Math.floor(h * 0.06), yb = Math.floor(h * 0.96);
+    const col = new Array(w).fill(0);
+    for (let y = ya; y < yb; y++) for (let x = 0; x < w; x++) if (dark(x, y)) col[x]++;
+    const body = col.slice(Math.floor(w * 0.15), Math.floor(w * 0.85)).sort((a, b) => a - b);
+    const med = body[body.length >> 1];
+    if (med < 20) return null; // hardly any text
+    const thr = Math.max(3, med * 0.4);
+    let best = null;
+    for (let x = Math.floor(w * 0.4), run = null; x <= Math.ceil(w * 0.6); x++) {
+      if (x < Math.ceil(w * 0.6) && col[x] <= thr) { if (run == null) run = x; continue; }
+      if (run != null && (!best || x - run > best[1] - best[0])) best = [run, x];
+      run = null;
+    }
+    if (!best || best[1] - best[0] < 10) return null;
+    const gx = best[0] + 1;
+    // rows where something crosses the cut (padded so a crossing text line is taken whole)
+    const cross = new Uint8Array(h);
+    for (let y = 0; y < h; y++) for (let x = gx - 1; x <= gx + 1; x++) if (dark(x, y)) { for (let k = Math.max(0, y - 7); k < Math.min(h, y + 8); k++) cross[k] = 1; break; }
+    const bands = [];
+    for (let y = 0; y < h;) {
+      let e = y;
+      while (e < h && cross[e] === cross[y]) e++;
+      bands.push({ y0: y, y1: e, split: !cross[y], gx });
+      y = e;
+    }
+    // thin split bands between crossings are just line gaps: fold them into their neighbours
+    for (let i = bands.length - 1; i >= 0; i--) if (bands[i].split && bands[i].y1 - bands[i].y0 < 14 && bands.length > 1) {
+      const j = i > 0 ? i - 1 : i + 1;
+      bands[j].y0 = Math.min(bands[j].y0, bands[i].y0); bands[j].y1 = Math.max(bands[j].y1, bands[i].y1);
+      bands.splice(i, 1);
+    }
+    for (let i = bands.length - 1; i > 0; i--) if (bands[i].split === bands[i - 1].split) { bands[i - 1].y1 = bands[i].y1; bands.splice(i, 1); }
+    return bands.some((b) => b.split) ? bands : null;
   }
 
   // Raw OCR words → text items (points). Kept separate from recognition so cached pages
@@ -105,7 +210,7 @@
       if (!t) continue;
       const bh = y1 - y0;
       if (conf < 35 && !/^[A-K]\.$|^\d{1,2}\.$/.test(t)) continue;
-      if (bh < medRow * 0.45 && !/^[.,;:'’"”—-]+$/.test(t)) continue; // tiny question markers under underlines are unreadable at scan resolution
+      if (bh < medRow * 0.38 && !/^[.,;:'’"”—-]+$/.test(t)) continue; // tiny question markers under underlines are unreadable at scan resolution
       let h = rowH / SCALE; // Tesseract's row height ≈ 1 em
       // digits have no descenders: their box height is the cap height (~0.7 em), which reveals
       // smaller-type numbers such as reading-passage line numbers
@@ -196,7 +301,7 @@
     const k = A / SCALE;
     for (const wd of words) {
       const [text, x0, y0, x1, y1, , conf] = Array.isArray(wd) ? wd : [wd.w.text, wd.w.bbox.x0, wd.w.bbox.y0, wd.w.bbox.x1, wd.w.bbox.y1, 0, wd.w.confidence];
-      if (conf >= 55 && text.trim().length) clear(x0 * k - 1, y0 * k - 1, x1 * k + 1, y1 * k + 1);
+      if ((conf >= 55 && text.trim().length) || (conf >= 20 && /[A-Za-z0-9]{3,}/.test(text))) clear(x0 * k - 1, y0 * k - 1, x1 * k + 1, y1 * k + 1);
     }
     for (const r of thin) if (r.dk >= r.n * 0.5) clear(r.x0 - 1, r.y0 - 1, r.x1 + 1, r.y1 + 1);
     // connected components (8-neighbour)
@@ -237,7 +342,9 @@
       if (hit) { const page = await pdf.getPage(pno); out.set(pno, await finish(hit, page)); page.cleanup(); done++; onEach && onEach(done, pnos.length, pno); } else todo.push(pno);
     }
     if (!todo.length) return out;
+    onEach && onEach(done, pnos.length, null, 'Starting the text-recognition engine (the first time this downloads about 10 MB)…');
     const workers = await getPool();
+    onEach && onEach(done, pnos.length, null, 'Reading the scanned pages…');
     let next = 0;
     await Promise.all(workers.map(async (w) => {
       while (next < todo.length) {

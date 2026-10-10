@@ -52,8 +52,8 @@
       const ctx = c.getContext('2d');
       ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h);
       ctx.drawImage(src, Math.round(x0), Math.round(y0), w, h, 0, 0, w, h);
-      const blob = await new Promise((r) => c.toBlob(r, 'image/png'));
-      return URL.createObjectURL(blob);
+      // (toBlob waits ~1 s when the tab isn't in front; toDataURL is synchronous and fast)
+      return c.toDataURL('image/png');
     })();
     crops.set(key, p);
     return p;
@@ -73,5 +73,11 @@
     return el;
   }
 
-  TS.render = { open, close, img, crop, get openId() { return docId; } };
+  // Warm the cache for blocks about to be shown (the next question's figures / scanned choices).
+  function prefetch(blocks) {
+    if (!doc) return;
+    for (const b of blocks || []) if (b && b.t === 'fig' && b.rect) crop(b.page, b.rect).catch(() => {});
+  }
+
+  TS.render = { open, close, img, crop, prefetch, get openId() { return docId; } };
 })();
